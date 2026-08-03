@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# Core: configuration + MSSQL persistence (used by every service)
+# ---------------------------------------------------------------------------
+SQLAlchemy>=2.0.30,<3.0
+pyodbc>=5.1.0            # requires the Microsoft ODBC Driver 18 for SQL Server
+python-dotenv>=1.0.1
+alembic>=1.13.1          # schema migrations once the model stabilises
+
+# ---------------------------------------------------------------------------
+# Data handling
+# ---------------------------------------------------------------------------
+pandas>=2.2.0
+numpy>=1.26.0
+python-dateutil>=2.9.0
+isodate>=0.6.1           # parses YouTube's ISO-8601 PT#M#S durations
+tenacity>=8.2.3          # retry/backoff for flaky third-party APIs
+tqdm>=4.66.0             # collection progress bars
+
+# ---------------------------------------------------------------------------
+# services/01_youtube_collector
+# ---------------------------------------------------------------------------
+google-api-python-client>=2.125.0
+youtube-transcript-api>=0.6.2
+yt-dlp>=2024.4.9         # audio/video download for the tempo metrics
+requests>=2.31.0         # Return YouTube Dislike API
+librosa>=0.10.1          # silence ratio, pitch variance
+soundfile>=0.12.1
+opencv-python-headless>=4.9.0  # scene-cut detection
+ffmpeg-python>=0.2.0     # requires the ffmpeg binary on PATH
+Pillow>=10.3.0
+
+# ---------------------------------------------------------------------------
+# services/02_ai_analyzer
+# ---------------------------------------------------------------------------
+openai>=1.30.0
+pydantic>=2.7.0          # structured-output validation for AI scores
+
+# ---------------------------------------------------------------------------
+# services/03_predictor_engine
+# ---------------------------------------------------------------------------
+scikit-learn>=1.4.2
+lightgbm>=4.3.0
+joblib>=1.4.0
+matplotlib>=3.8.4
+
+# ---------------------------------------------------------------------------
+# Tooling (optional but recommended)
+# ---------------------------------------------------------------------------
+pytest>=8.2.0
+ruff>=0.4.4

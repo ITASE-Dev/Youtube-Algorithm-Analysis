@@ -1,0 +1,24 @@
+[tool.ruff]
+line-length = 110
+target-version = "py313"
+exclude = [".venv", ".media_cache"]
+
+[tool.ruff.lint]
+# Correctness-focused set. `Optional[X]` is kept deliberately: it reads better
+# inside SQLAlchemy's Mapped[...] annotations than `X | None`.
+select = ["E", "F", "W", "B", "I", "C4", "SIM", "RUF", "BLE", "N"]
+ignore = [
+    "E501",    # line length is handled by the formatter
+    "B008",    # function call in default arg -- intentional for dataclass fields
+    "RUF012",  # ClassVar on SQLAlchemy's type_annotation_map is noise
+    "RUF001",  # Turkish text (ı, ş, ğ) is expected here, not a homoglyph attack
+    "RUF002",
+    "RUF003",
+]
+# BLE001 and E402 stay enabled so the deliberate `# noqa:` markers in the
+# collector (broad excepts around unofficial APIs, sys.path bootstrap) remain
+# visible as conscious decisions rather than silent exemptions.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
