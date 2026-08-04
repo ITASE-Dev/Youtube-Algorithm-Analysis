@@ -65,6 +65,16 @@ def _get_int(key: str, default: int) -> int:
         raise ConfigurationError(f"Environment variable '{key}' must be an integer, got {raw!r}.") from exc
 
 
+def _get_float(key: str, default: float) -> float:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"Environment variable '{key}' must be a number, got {raw!r}.") from exc
+
+
 def _get_bool(key: str, default: bool) -> bool:
     raw = os.getenv(key, "").strip().lower()
     if not raw:
@@ -114,6 +124,14 @@ class Settings:
         default_factory=lambda: _get(
             "RETURNYOUTUBEDISLIKE_API_URL", "https://returnyoutubedislikeapi.com/votes"
         )
+    )
+    #: Optional proxy for the transcript scraper. YouTube blocks IPs that pull
+    #: captions in bulk; routing through a proxy is the way out without waiting.
+    transcript_proxy_url: str = field(default_factory=lambda: _get("TRANSCRIPT_PROXY_URL", ""))
+    #: Seconds between transcript requests. The caption endpoint is the first
+    #: thing YouTube rate-limits; raise this after a block rather than lower it.
+    transcript_min_interval: float = field(
+        default_factory=lambda: _get_float("TRANSCRIPT_MIN_INTERVAL", 1.0)
     )
 
     # --- Misc ------------------------------------------------------------

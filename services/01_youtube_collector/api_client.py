@@ -41,6 +41,10 @@ from tenacity import (
 )
 from youtube_transcript_api import (
     CouldNotRetrieveTranscript,
+    IpBlocked,
+    PoTokenRequired,
+    RequestBlocked,
+    YouTubeRequestFailed,
     YouTubeTranscriptApi,
     YouTubeTranscriptApiException,
 )
@@ -54,6 +58,14 @@ MAX_IDS_PER_REQUEST = 50
 
 #: Preference order when several caption tracks exist.
 DEFAULT_TRANSCRIPT_LANGUAGES: tuple[str, ...] = ("tr", "en", "en-US", "en-GB")
+
+#: Transcript failures caused by YouTube refusing *this IP*, not by the video.
+#: These must never be recorded as "we checked and there is nothing there".
+BLOCKING_ERRORS = (IpBlocked, RequestBlocked, PoTokenRequired, YouTubeRequestFailed)
+
+#: Consecutive blocks after which a sweep should stop asking. Hammering a
+#: blocked endpoint only extends the block.
+BLOCK_ABORT_THRESHOLD = 5
 
 
 class CollectorError(RuntimeError):
@@ -197,12 +209,22 @@ class VideoData:
 
 @dataclass(slots=True)
 class TranscriptData:
-    """Transcript text plus the derived word metrics."""
+    """Transcript text plus the derived word metrics.
+
+    ``blocked`` separates the two very different reasons for an empty result:
+
+    * ``blocked=False`` -- this video has no captions and never will. Record
+      the attempt and move on.
+    * ``blocked=True``  -- YouTube is refusing *our IP*, so the answer says
+      nothing about the video. Callers must NOT record an attempt, or a
+      temporary block would permanently write off every video in the queue.
+    """
 
     text: Optional[str] = None
     word_count: Optional[int] = None
     language: Optional[str] = None
     is_generated: Optional[bool] = None
+    blocked: bool = False
 
     def words_per_minute(self, duration_seconds: Optional[int]) -> Optional[float]:
         """Speaking rate, or ``None`` when either input is missing/zero."""
@@ -320,9 +342,12 @@ class YouTubeDataClient:
         )
 
     def resolve_channel_id(self, handle_or_id: str) -> Optional[str]:
-        """Resolve a ``@handle`` or channel URL to a ``UC...`` channel id.
+        """Resolve a channel id, ``@handle``, bare handle or URL to ``UC...``.
 
-        Plain ``UC...`` ids are returned untouched without spending quota.
+        Plain ``UC...`` ids are returned untouched without spending quota. A
+        bare word (``ThePrimeTimeagen``) is treated as a handle: PowerShell
+        eats a leading ``@`` as its splatting operator unless the argument is
+        quoted, so requiring one would break the obvious command line.
         """
         value = handle_or_id.strip()
         if value.startswith("UC") and len(value) == 24:
@@ -332,14 +357,20 @@ class YouTubeDataClient:
         if match:
             return match.group(1)
 
-        handle = re.search(r"@([\w.\-]+)", value)
-        if not handle:
-            logger.error("Could not interpret %r as a channel id or handle.", handle_or_id)
+        # @handle, youtube.com/@handle, or a bare handle.
+        handle_match = re.search(r"@([\w.\-]+)", value)
+        if handle_match:
+            handle = handle_match.group(1)
+        elif re.fullmatch(r"[\w.\-]+", value):
+            handle = value
+            logger.debug("Treating %r as a bare handle.", value)
+        else:
+            logger.error("Could not interpret %r as a channel id, handle or URL.", handle_or_id)
             return None
 
         try:
             response = self._execute(
-                self._service.channels().list(part="id", forHandle=f"@{handle.group(1)}", maxResults=1)
+                self._service.channels().list(part="id", forHandle=f"@{handle}", maxResults=1)
             )
         except CollectorError:
             raise
@@ -349,7 +380,7 @@ class YouTubeDataClient:
 
         items = response.get("items") or []
         if not items:
-            logger.error("No channel found for handle @%s.", handle.group(1))
+            logger.error("No channel found for handle @%s.", handle)
             return None
         return items[0]["id"]
 
@@ -522,22 +553,51 @@ class ShortsProbe:
 class TranscriptClient:
     """Fetches caption tracks, preferring manually written ones.
 
-    Every failure mode -- captions disabled, no track in our languages, video
-    unplayable, YouTube blocking the IP -- is logged and turned into an empty
-    :class:`TranscriptData`.
+    Every failure mode is logged and turned into an empty
+    :class:`TranscriptData`, but they are not all equal: exceptions in
+    :data:`BLOCKING_ERRORS` mean YouTube is refusing this IP, and the result
+    is flagged ``blocked=True`` so callers can stop rather than mistake a
+    network-wide block for 50 caption-less videos.
+
+    An optional ``HTTP_PROXY_URL`` in ``.env`` routes requests through a proxy,
+    which is the practical way out of a block without waiting it out.
     """
 
-    def __init__(self, languages: Iterable[str] = DEFAULT_TRANSCRIPT_LANGUAGES) -> None:
+    def __init__(
+        self,
+        languages: Iterable[str] = DEFAULT_TRANSCRIPT_LANGUAGES,
+        *,
+        min_interval: Optional[float] = None,
+        proxy_url: Optional[str] = None,
+    ) -> None:
         self._languages = tuple(languages)
-        self._api = YouTubeTranscriptApi()
+        # Unthrottled scraping is what earns the IP block in the first place.
+        # Tune with TRANSCRIPT_MIN_INTERVAL in .env: raise it after a block,
+        # never lower it to "catch up".
+        interval = settings.transcript_min_interval if min_interval is None else min_interval
+        self._limiter = _RateLimiter(interval)
+
+        proxy = proxy_url or settings.transcript_proxy_url
+        proxy_config = None
+        if proxy:
+            from youtube_transcript_api.proxies import GenericProxyConfig
+
+            proxy_config = GenericProxyConfig(http_url=proxy, https_url=proxy)
+            logger.info("Transcript requests will go through a proxy.")
+
+        self._api = YouTubeTranscriptApi(proxy_config=proxy_config)
 
     def fetch(self, video_id: str) -> TranscriptData:
         """Return the transcript for ``video_id``; never raises."""
+        self._limiter.wait()
         try:
             fetched = self._api.fetch(video_id, languages=self._languages)
+        except BLOCKING_ERRORS as exc:
+            logger.warning("YouTube is blocking this IP (%s) on %s.", type(exc).__name__, video_id)
+            return TranscriptData(blocked=True)
         except CouldNotRetrieveTranscript as exc:
-            # Covers TranscriptsDisabled, NoTranscriptFound, VideoUnavailable,
-            # IpBlocked, AgeRestricted -- all expected, none fatal.
+            # TranscriptsDisabled, NoTranscriptFound, VideoUnavailable,
+            # AgeRestricted: genuine properties of the video.
             logger.warning("No transcript for %s: %s", video_id, type(exc).__name__)
             return self._fallback_any_language(video_id)
         except YouTubeTranscriptApiException as exc:
@@ -561,6 +621,8 @@ class TranscriptClient:
             if transcript is None:
                 return TranscriptData()
             return self._build(transcript.fetch())
+        except BLOCKING_ERRORS:
+            return TranscriptData(blocked=True)
         except (CouldNotRetrieveTranscript, YouTubeTranscriptApiException):
             return TranscriptData()
         except Exception as exc:  # noqa: BLE001

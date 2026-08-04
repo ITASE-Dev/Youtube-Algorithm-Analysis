@@ -190,6 +190,17 @@ class Video(TimestampMixin, Base):
         Float, doc="like_count / dislike_count."
     )
 
+    # Attempt markers. A NULL data column means "we have no value"; these say
+    # whether we already went looking for one. Without them a video whose
+    # captions are permanently disabled would be re-fetched on every run,
+    # forever, because the backfill query keys on `full_transcript IS NULL`.
+    transcript_checked_at: Mapped[Optional[dt.datetime]] = mapped_column(
+        UTCDateTime, doc="Last transcript fetch attempt, successful or not."
+    )
+    dislike_checked_at: Mapped[Optional[dt.datetime]] = mapped_column(
+        UTCDateTime, doc="Last dislike API attempt, successful or not."
+    )
+
     # ------------------------------------------------------------------ #
     # Audio & visual tempo (Librosa / OpenCV / FFmpeg)                    #
     # ------------------------------------------------------------------ #
@@ -203,7 +214,13 @@ class Video(TimestampMixin, Base):
         Float, doc="Detected shot changes per minute; a proxy for edit pacing."
     )
     media_analyzed_at: Mapped[Optional[dt.datetime]] = mapped_column(
-        UTCDateTime, doc="When audio/visual metrics were last computed."
+        UTCDateTime, doc="When audio/visual metrics were last computed successfully."
+    )
+    media_checked_at: Mapped[Optional[dt.datetime]] = mapped_column(
+        UTCDateTime, doc="Last media analysis attempt, successful or not."
+    )
+    media_error: Mapped[Optional[str]] = mapped_column(
+        Unicode(300), doc="Why the last media analysis failed (download blocked, corrupt file...)."
     )
 
     # ------------------------------------------------------------------ #
@@ -233,7 +250,15 @@ class Video(TimestampMixin, Base):
         UTCDateTime, doc="When the AI enrichment last succeeded."
     )
     ai_model_version: Mapped[Optional[str]] = mapped_column(
-        Unicode(64), doc="Model id used for the scores above, for reproducibility."
+        Unicode(64), doc="Resolved model snapshot behind the text scores, e.g. gpt-4o-mini-2024-07-18."
+    )
+    # Text and vision are separate services running separate models; sharing one
+    # version column would mean whichever ran last silently claimed both.
+    vision_analyzed_at: Mapped[Optional[dt.datetime]] = mapped_column(
+        UTCDateTime, doc="When the thumbnail vision analysis last succeeded."
+    )
+    vision_model_version: Mapped[Optional[str]] = mapped_column(
+        Unicode(64), doc="Resolved model snapshot behind the thumbnail scores."
     )
 
     # ------------------------------------------------------------------ #

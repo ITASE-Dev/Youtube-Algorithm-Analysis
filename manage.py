@@ -6,6 +6,8 @@ Usage::
     python manage.py createdb   # create the target database if it is missing
     python manage.py initdb     # create any missing tables
     python manage.py schema     # list tables and their column counts
+    python manage.py addcols    # show ALTER TABLE for new model columns
+    python manage.py addcols --apply
 """
 
 from __future__ import annotations
@@ -14,10 +16,11 @@ import argparse
 import logging
 import sys
 
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from core.config import settings
 from core.database import get_engine, healthcheck, init_db
+from core.models import Base
 
 
 def _cmd_check() -> int:
@@ -71,15 +74,68 @@ def _cmd_schema() -> int:
     return 0
 
 
+def _cmd_addcols(apply: bool = False) -> int:
+    """Add nullable columns that exist on the models but not yet in MSSQL.
+
+    ``create_all`` only creates missing *tables*; it never alters an existing
+    one. This covers the common additive case during development.
+
+    Deliberately limited: it only ever emits ``ALTER TABLE ... ADD`` for
+    nullable columns. Drops, renames, type changes and anything touching data
+    are out of scope -- use Alembic for those.
+    """
+    engine = get_engine()
+    inspector = inspect(engine)
+    statements: list[str] = []
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in inspector.get_table_names():
+            print(f"{table.name}: table missing entirely -- run `initdb` first.")
+            continue
+
+        existing = {c["name"].lower() for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name.lower() in existing:
+                continue
+            if not column.nullable:
+                print(f"SKIP {table.name}.{column.name}: NOT NULL columns need a manual migration.")
+                continue
+            ddl_type = column.type.compile(dialect=engine.dialect)
+            statements.append(f"ALTER TABLE [{table.name}] ADD [{column.name}] {ddl_type} NULL;")
+
+    if not statements:
+        print("Database schema already matches the models.")
+        return 0
+
+    for statement in statements:
+        print(statement)
+
+    if not apply:
+        print(f"\n{len(statements)} column(s) missing. Re-run with --apply to execute.")
+        return 0
+
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.execute(text(statement))
+    print(f"\nApplied {len(statements)} column addition(s).")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["check", "createdb", "initdb", "schema"])
+    parser.add_argument("command", choices=["check", "createdb", "initdb", "schema", "addcols"])
+    parser.add_argument(
+        "--apply", action="store_true", help="addcols: execute the ALTER statements instead of printing them."
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.command == "addcols":
+        return _cmd_addcols(apply=args.apply)
+
     commands = {
         "check": _cmd_check,
         "createdb": _cmd_createdb,

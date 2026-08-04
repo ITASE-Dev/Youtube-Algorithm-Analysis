@@ -38,6 +38,7 @@ if str(WORKSPACE_ROOT) not in sys.path:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from api_client import (  # noqa: E402
+    BLOCK_ABORT_THRESHOLD,
     ChannelData,
     CollectorClients,
     CollectorError,
@@ -72,6 +73,7 @@ class RunStats:
     unavailable: int = 0
     transcripts_ok: int = 0
     transcripts_missing: int = 0
+    transcripts_blocked: int = 0
     dislikes_ok: int = 0
     dislikes_missing: int = 0
     errors: int = 0
@@ -84,6 +86,11 @@ class RunStats:
         logger.info("  skipped        : %d (already present, --only-new)", self.skipped_existing)
         logger.info("  unavailable    : %d (deleted/private)", self.unavailable)
         logger.info("Transcripts      : %d ok / %d missing", self.transcripts_ok, self.transcripts_missing)
+        if self.transcripts_blocked:
+            logger.warning(
+                "  blocked by IP  : %d (not written off; rerun the enricher later)",
+                self.transcripts_blocked,
+            )
         logger.info("Dislikes         : %d ok / %d missing", self.dislikes_ok, self.dislikes_missing)
         logger.info("Row errors       : %d", self.errors)
         logger.info("=" * 62)
@@ -261,6 +268,7 @@ def collect_channel(
             details_map = clients.youtube.get_videos(video_ids)
 
             pending = 0
+            consecutive_blocks = 0
             progress = tqdm(video_ids, desc="Collecting", unit="video", ncols=90)
             for video_id in progress:
                 progress.set_postfix_str(video_id)
@@ -283,8 +291,24 @@ def collect_channel(
                     transcript = clients.transcripts.fetch(video_id)
                     if transcript.text:
                         stats.transcripts_ok += 1
+                        consecutive_blocks = 0
+                    elif transcript.blocked:
+                        stats.transcripts_blocked += 1
+                        consecutive_blocks += 1
+                        if consecutive_blocks >= BLOCK_ABORT_THRESHOLD:
+                            # The block is IP-wide: the remaining videos would
+                            # each cost a pointless request and deepen it.
+                            # Metadata and dislikes still collect fine.
+                            logger.error(
+                                "YouTube has blocked this IP for transcripts (%d in a row). "
+                                "Skipping transcripts for the rest of this run; rerun "
+                                "fetch_transcripts_and_dislikes.py later to fill them in.",
+                                consecutive_blocks,
+                            )
+                            skip_transcripts = True
                     else:
                         stats.transcripts_missing += 1
+                        consecutive_blocks = 0
 
                 dislikes = DislikeData()
                 if not skip_dislikes:
