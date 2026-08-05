@@ -33,7 +33,7 @@ Accepts a channel id, an `@handle`, or a channel URL.
 | `--only-new` | Skip videos already in the database instead of refreshing them |
 | `--skip-transcripts` | Do not call the transcript API |
 | `--skip-dislikes` | Do not call the Return YouTube Dislike API |
-| `--verify-shorts` | Confirm Shorts via HTTP probe instead of the `duration<=60s` proxy |
+| `--skip-shorts-probe` | Leave `is_shorts` NULL for 60–180s videos instead of probing |
 | `--log-level` | DEBUG / INFO / WARNING / ERROR |
 
 ## Behaviour worth knowing
@@ -72,6 +72,18 @@ python services/01_youtube_collector/fetch_transcripts_and_dislikes.py --limit 2
 ```
 
 `--only transcripts|dislikes|both`, `--channel UC...`, `--batch-size`, `--retry-failed`.
+
+**Shorts are up to 3 minutes now.** YouTube raised the limit from 60s in late
+2024, so duration alone no longer identifies a Short — the old `duration <= 60`
+rule mislabelled 17 of the 32 videos between 40s and 200s in this dataset, every
+one of them a Short filed as long-form. `classify_shorts_by_duration` now
+answers only where duration is decisive (`≤60s` yes, `>180s` no) and returns
+`None` in between; `ShortsProbe` resolves those with one HEAD request to
+`/shorts/<id>`, which costs no API quota and fires for a handful of videos per
+channel. `repair_shorts.py` re-labels rows collected under the old rule.
+
+This matters beyond a tidy column: stage 3 builds separate baselines per format,
+so a wrong label puts a video in the wrong comparison group.
 
 **IP blocks are not "no captions".** `youtube-transcript-api` scrapes the player
 page, and YouTube blocks IPs that pull captions in bulk — roughly 100 in 20

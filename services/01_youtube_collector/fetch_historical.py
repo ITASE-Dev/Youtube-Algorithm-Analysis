@@ -74,6 +74,7 @@ class RunStats:
     transcripts_ok: int = 0
     transcripts_missing: int = 0
     transcripts_blocked: int = 0
+    shorts_probed: int = 0
     dislikes_ok: int = 0
     dislikes_missing: int = 0
     errors: int = 0
@@ -92,6 +93,8 @@ class RunStats:
                 self.transcripts_blocked,
             )
         logger.info("Dislikes         : %d ok / %d missing", self.dislikes_ok, self.dislikes_missing)
+        if self.shorts_probed:
+            logger.info("Shorts probed    : %d (60-180s, undecidable by duration)", self.shorts_probed)
         logger.info("Row errors       : %d", self.errors)
         logger.info("=" * 62)
 
@@ -220,12 +223,12 @@ def collect_channel(
     batch_size: int = 10,
     skip_transcripts: bool = False,
     skip_dislikes: bool = False,
-    verify_shorts: bool = False,
+    skip_shorts_probe: bool = False,
     only_new: bool = False,
 ) -> RunStats:
     """Run the full collection for one channel and return the run counters."""
     stats = RunStats()
-    clients = CollectorClients(shorts_probe=ShortsProbe() if verify_shorts else None)
+    clients = CollectorClients(shorts_probe=None if skip_shorts_probe else ShortsProbe())
 
     try:
         channel_id = clients.youtube.resolve_channel_id(channel_input)
@@ -279,12 +282,15 @@ def collect_channel(
                     stats.unavailable += 1
                     continue
 
-                if verify_shorts and clients.shorts_probe is not None:
+                # Only the 60s-180s band is ambiguous, so the probe fires for a
+                # handful of videos per channel rather than all of them.
+                if clients.shorts_probe is not None and details.is_shorts is None:
                     probed = clients.shorts_probe.is_shorts(
                         video_id, duration_seconds=details.duration_seconds
                     )
                     if probed is not None:
                         details.is_shorts = probed
+                        stats.shorts_probed += 1
 
                 transcript = TranscriptData()
                 if not skip_transcripts:
@@ -379,9 +385,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-transcripts", action="store_true", help="Do not fetch captions.")
     parser.add_argument("--skip-dislikes", action="store_true", help="Do not call the dislike API.")
     parser.add_argument(
-        "--verify-shorts",
+        "--skip-shorts-probe",
         action="store_true",
-        help="Confirm Shorts via an HTTP probe instead of the duration<=60s proxy.",
+        help="Do not resolve 60-180s videos via HTTP; leaves is_shorts NULL for them.",
     )
     parser.add_argument(
         "--only-new", action="store_true", help="Skip videos already stored instead of refreshing them."
@@ -421,7 +427,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         batch_size=args.batch_size,
         skip_transcripts=args.skip_transcripts,
         skip_dislikes=args.skip_dislikes,
-        verify_shorts=args.verify_shorts,
+        skip_shorts_probe=args.skip_shorts_probe,
         only_new=args.only_new,
     )
     stats.log_summary()

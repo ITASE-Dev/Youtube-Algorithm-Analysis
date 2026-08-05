@@ -180,11 +180,21 @@ def find_pending_videos(
     limit: Optional[int] = None,
     channel_id: Optional[str] = None,
     reanalyze: bool = False,
+    require_transcript: bool = False,
 ) -> list[Video]:
-    """Return videos that have a transcript but no text scores yet."""
-    stmt = select(Video).where(Video.full_transcript.is_not(None))
+    """Return videos still missing text scores.
+
+    A transcript is *not* required by default. ``curiosity_gap_score``,
+    ``emotion_tone`` and ``niche_relevance`` are largely title-driven, and
+    demanding a transcript excluded half the dataset from semantic features
+    entirely. Only ``hook_score`` genuinely needs the spoken opening, and it is
+    left NULL for those rows rather than guessed.
+    """
+    stmt = select(Video)
+    if require_transcript:
+        stmt = stmt.where(Video.full_transcript.is_not(None))
     if not reanalyze:
-        stmt = stmt.where(Video.hook_score.is_(None))
+        stmt = stmt.where(Video.curiosity_gap_score.is_(None))
     if channel_id:
         stmt = stmt.where(Video.channel_id == channel_id)
     stmt = stmt.order_by(Video.published_at.desc())
@@ -194,15 +204,25 @@ def find_pending_videos(
 
 
 def build_messages(video: Video, *, max_chars: int) -> list[dict[str, str]]:
-    """Assemble the two-message payload for one video."""
+    """Assemble the two-message payload for one video.
+
+    When there is no transcript the model is told so explicitly, rather than
+    being handed an empty block it might silently invent an opening for.
+    """
     transcript = (video.full_transcript or "")[:max_chars].strip()
-    if not transcript:
-        transcript = "(no transcript text available)"
+
+    if transcript:
+        body = f"TRANSCRIPT OPENING (first {len(transcript)} characters):\n{transcript}"
+    else:
+        body = (
+            "TRANSCRIPT: not available for this video (captions are disabled).\n"
+            "Judge the title only. Score hook_score as 1.0 -- it will be discarded, "
+            "not stored -- and base the other three scores on the title alone."
+        )
 
     user_content = (
         f"TITLE: {video.title or '(untitled)'}\n"
-        f"DURATION: {video.duration_seconds or 'unknown'} seconds\n\n"
-        f"TRANSCRIPT OPENING (first {len(transcript)} characters):\n{transcript}"
+        f"DURATION: {video.duration_seconds or 'unknown'} seconds\n\n{body}"
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -211,8 +231,13 @@ def build_messages(video: Video, *, max_chars: int) -> list[dict[str, str]]:
 
 
 def apply_analysis(video: Video, analysis: VideoTextAnalysis, model: str) -> None:
-    """Write the scores onto the ORM object, clamping to the allowed range."""
-    video.hook_score = clamp_score(analysis.hook_score)
+    """Write the scores onto the ORM object, clamping to the allowed range.
+
+    ``hook_score`` is only stored when a transcript backed it. Without the
+    spoken opening the model has nothing to judge, and a title-derived guess
+    would look identical to a measurement in the training data.
+    """
+    video.hook_score = clamp_score(analysis.hook_score) if video.full_transcript else None
     video.curiosity_gap_score = clamp_score(analysis.curiosity_gap_score)
     video.niche_relevance = clamp_score(analysis.niche_relevance)
     video.emotion_tone = analysis.emotion_tone
@@ -231,6 +256,7 @@ def run(
     max_chars: int = 3000,
     channel_id: Optional[str] = None,
     reanalyze: bool = False,
+    require_transcript: bool = False,
     dry_run: bool = False,
 ) -> RunStats:
     """Score every pending video, committing every ``batch_size`` rows."""
@@ -241,7 +267,11 @@ def run(
     try:
         with managed_session() as session:
             videos = find_pending_videos(
-                session, limit=limit, channel_id=channel_id, reanalyze=reanalyze
+                session,
+                limit=limit,
+                channel_id=channel_id,
+                reanalyze=reanalyze,
+                require_transcript=require_transcript,
             )
             if not videos:
                 logger.info("Nothing pending -- every transcript already has text scores.")
@@ -346,6 +376,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reanalyze", action="store_true", help="Re-score videos that already have scores."
     )
     parser.add_argument(
+        "--require-transcript",
+        action="store_true",
+        help="Only score videos that have a transcript (skips title-only scoring).",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Call the API and print results without saving."
     )
     parser.add_argument("--log-level", default=settings.log_level, help="DEBUG, INFO, WARNING, ERROR.")
@@ -378,6 +413,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_chars=args.max_chars,
         channel_id=args.channel,
         reanalyze=args.reanalyze,
+        require_transcript=args.require_transcript,
         dry_run=args.dry_run,
     )
     stats.log_summary()

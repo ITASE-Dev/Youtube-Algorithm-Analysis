@@ -142,8 +142,21 @@ def test_parse_video_falls_back_through_thumbnail_sizes():
     }
     v = YouTubeDataClient._parse_video(item)
     assert v.thumbnail_url_maxres == "https://i/high.jpg"
-    assert v.is_shorts is True          # <= 60s proxy
+    assert v.is_shorts is True          # under 60s: certain
     assert v.tags is None
+
+
+def test_shorts_classification_admits_the_ambiguous_band():
+    """Since the 3-minute limit, 61-180s cannot be settled by duration alone."""
+    from api_client import classify_shorts_by_duration
+
+    assert classify_shorts_by_duration(30) is True
+    assert classify_shorts_by_duration(60) is True
+    assert classify_shorts_by_duration(61) is None      # needs the probe
+    assert classify_shorts_by_duration(167) is None     # a real Short in our data
+    assert classify_shorts_by_duration(181) is False
+    assert classify_shorts_by_duration(2354) is False
+    assert classify_shorts_by_duration(None) is None
 
 
 def test_hidden_like_count_stays_none_not_zero():

@@ -26,13 +26,14 @@ from calculate_targets import (  # noqa: E402
 )
 
 
-def _frame(views: list[int], channel: str = "UC_a") -> pd.DataFrame:
+def _frame(views: list[int], channel: str = "UC_a", shorts: list[bool] | None = None) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "video_id": [f"v{i:02d}" for i in range(len(views))],
             "channel_id": [channel] * len(views),
             "published_at": pd.date_range("2026-01-01", periods=len(views), freq="D"),
             "view_count": views,
+            "is_shorts": shorts if shorts is not None else [False] * len(views),
         }
     )
 
@@ -115,3 +116,41 @@ def test_sql_uses_a_strictly_preceding_window():
 def test_defaults_match_the_documented_business_rules():
     assert BASELINE_WINDOW == 10
     assert MIN_HISTORY == 3
+
+
+def test_shorts_and_long_form_get_separate_baselines():
+    """Interleaved formats differ ~2x in views; one baseline measures the mix."""
+    # Alternating: Shorts at 1000 views, long-form at 100_000.
+    views, shorts = [], []
+    for _ in range(6):
+        views += [1_000, 100_000]
+        shorts += [True, False]
+    frame = _frame(views, shorts=shorts)
+
+    split = shifted_rolling_mean(frame, window_size=10, min_history=3, split_by_format=True)
+    merged = shifted_rolling_mean(frame, window_size=10, min_history=3, split_by_format=False)
+
+    last_short = frame.index[-2]     # a Short, 1000 views
+    last_long = frame.index[-1]      # long-form, 100_000 views
+
+    # Split: each format is compared against its own kind, so ratios sit at 1.0.
+    assert split[last_short] == pytest.approx(1_000.0)
+    assert split[last_long] == pytest.approx(100_000.0)
+
+    # Merged: both are measured against the ~50k blended mean, so the Short
+    # looks like a catastrophe and the long video like a hit. Neither is true.
+    assert merged[last_short] == pytest.approx(50_500.0)
+    assert frame.view_count[last_short] / merged[last_short] < 0.05
+    assert frame.view_count[last_long] / merged[last_long] > 1.9
+
+
+def test_split_baseline_appears_in_the_sql():
+    assert "PARTITION BY channel_id, is_shorts" in _targets_sql(10, split_by_format=True)
+    assert "PARTITION BY channel_id\n" in _targets_sql(10, split_by_format=False)
+
+
+def test_undetermined_shorts_status_forms_its_own_group():
+    """is_shorts NULL must not silently drop rows from the baseline."""
+    frame = _frame([10, 20, 30, 40], shorts=[None, None, None, None])
+    baseline = shifted_rolling_mean(frame, window_size=10, min_history=3, split_by_format=True)
+    assert baseline.iloc[3] == pytest.approx(20.0)

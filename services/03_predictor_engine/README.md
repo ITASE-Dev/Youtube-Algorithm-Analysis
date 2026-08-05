@@ -17,11 +17,18 @@ python services/03_predictor_engine/calculate_targets.py --verify
 
 ```sql
 AVG(view_count) OVER (
-    PARTITION BY channel_id
+    PARTITION BY channel_id, is_shorts
     ORDER BY published_at, video_id
     ROWS BETWEEN 10 PRECEDING AND 1 PRECEDING
 )
 ```
+
+`is_shorts` is in the partition because the two formats are published
+interleaved and differ by roughly 2x in median views on the same channel. A
+shared baseline would measure format mix rather than performance: a long video
+following a run of Shorts would look like a hit purely because the baseline
+collapsed. `--no-split-shorts` restores the single channel-wide baseline.
+Correct `is_shorts` labels are a prerequisite — see `repair_shorts.py`.
 
 `AND 1 PRECEDING` — never `CURRENT ROW` — is the most important clause in the
 service. Including the current row would leak the answer into its own baseline:

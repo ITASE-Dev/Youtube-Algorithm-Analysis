@@ -92,10 +92,38 @@ def test_transcript_is_truncated_to_control_cost():
 
 
 def test_missing_transcript_still_produces_a_valid_payload():
+    """Half the dataset has no captions; those videos still get title scores."""
     video = _video(full_transcript=None)
     messages = build_messages(video, max_chars=3000)
-    assert "no transcript text available" in messages[1]["content"]
+    user = messages[1]["content"]
+
     assert messages[0]["role"] == "system"
+    assert "not available" in user
+    assert "Judge the title only" in user     # explicit, not an empty block
+    assert "Test Başlık" in user
+
+
+def test_hook_score_is_not_stored_without_a_transcript():
+    """A title-derived hook score would be indistinguishable from a measured one."""
+    from analyze_text import VideoTextAnalysis, apply_analysis
+
+    analysis = VideoTextAnalysis(
+        hook_score=1.0,
+        curiosity_gap_score=8.0,
+        emotion_tone="Tech",
+        niche_relevance=7.0,
+        reasoning="title only",
+    )
+
+    without = _video(full_transcript=None)
+    apply_analysis(without, analysis, "gpt-4o-mini-2024-07-18")
+    assert without.hook_score is None                 # discarded
+    assert without.curiosity_gap_score == 8.0         # kept: title-driven
+    assert without.emotion_tone == "Tech"
+
+    with_transcript = _video(full_transcript="some spoken words")
+    apply_analysis(with_transcript, analysis, "gpt-4o-mini-2024-07-18")
+    assert with_transcript.hook_score == 1.0          # measured, kept
 
 
 # --------------------------------------------------------------------------- #

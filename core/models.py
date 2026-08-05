@@ -170,7 +170,10 @@ class Video(TimestampMixin, Base):
 
     thumbnail_url_maxres: Mapped[Optional[str]] = mapped_column(Unicode(1024))
     is_shorts: Mapped[Optional[bool]] = mapped_column(
-        Boolean, doc="True when duration < 60s and the frame is vertical."
+        Boolean,
+        doc="True for Shorts. NULL means undetermined: since YouTube raised the "
+            "Shorts limit to 3 minutes, duration alone cannot decide between "
+            "60s and 180s -- only the /shorts/ URL probe can.",
     )
 
     # ------------------------------------------------------------------ #
@@ -188,6 +191,12 @@ class Video(TimestampMixin, Base):
     )
     like_dislike_ratio: Mapped[Optional[float]] = mapped_column(
         Float, doc="like_count / dislike_count."
+    )
+    dislike_rate: Mapped[Optional[float]] = mapped_column(
+        Float,
+        doc="dislike_count / view_count. Bounded and defined at zero dislikes, "
+            "unlike like_dislike_ratio which is unbounded (observed max 326) and "
+            "undefined when a video has none.",
     )
 
     # Attempt markers. A NULL data column means "we have no value"; these say

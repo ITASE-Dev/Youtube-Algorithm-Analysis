@@ -118,12 +118,12 @@ WITH baseline AS (
     SELECT
         video_id,
         AVG(CAST(view_count AS FLOAT)) OVER (
-            PARTITION BY channel_id
+            PARTITION BY channel_id{partition_extra}
             ORDER BY published_at, video_id
             ROWS BETWEEN {window_size:d} PRECEDING AND 1 PRECEDING
         ) AS avg_views,
         COUNT(view_count) OVER (
-            PARTITION BY channel_id
+            PARTITION BY channel_id{partition_extra}
             ORDER BY published_at, video_id
             ROWS BETWEEN {window_size:d} PRECEDING AND 1 PRECEDING
         ) AS history_count
@@ -137,6 +137,11 @@ SET
         WHEN v.view_count = 0 THEN 0.0
         ELSE (COALESCE(v.like_count, 0) + COALESCE(v.comment_count, 0))
              / CAST(v.view_count AS FLOAT)
+    END,
+    dislike_rate = CASE
+        WHEN v.view_count IS NULL OR v.dislike_count IS NULL THEN NULL
+        WHEN v.view_count = 0 THEN 0.0
+        ELSE v.dislike_count / CAST(v.view_count AS FLOAT)
     END,
     recent_channel_avg_views = CASE
         WHEN b.history_count >= :min_history THEN b.avg_views
@@ -153,12 +158,22 @@ JOIN baseline b ON b.video_id = v.video_id
 """
 
 
-def _targets_sql(window_size: int) -> str:
-    """Return the UPDATE with the window bound baked in as a literal integer."""
+def _targets_sql(window_size: int, *, split_by_format: bool = True) -> str:
+    """Return the UPDATE with the window bound baked in as a literal integer.
+
+    ``split_by_format`` adds ``is_shorts`` to the partition, so a Short is
+    compared against previous Shorts and a long video against previous long
+    videos. On this dataset the two formats differ by roughly 2x in median
+    views on the same channel, and they are published interleaved -- a shared
+    baseline therefore measures format mix rather than performance.
+    """
     size = int(window_size)
     if size < 1:
         raise ValueError("window size must be at least 1")
-    return TARGETS_SQL_TEMPLATE.format(window_size=size)
+    return TARGETS_SQL_TEMPLATE.format(
+        window_size=size,
+        partition_extra=", is_shorts" if split_by_format else "",
+    )
 
 
 def compute_targets(
@@ -166,10 +181,11 @@ def compute_targets(
     *,
     window_size: int = BASELINE_WINDOW,
     min_history: int = MIN_HISTORY,
+    split_by_format: bool = True,
 ) -> int:
     """Run the bulk UPDATE. Returns the number of rows touched."""
     result = session.execute(
-        text(_targets_sql(window_size)),
+        text(_targets_sql(window_size, split_by_format=split_by_format)),
         {
             "min_history": min_history,
             "computed_at": _utcnow(),
@@ -245,26 +261,32 @@ def warn_about_young_videos(session: Session, *, days: int = 30) -> None:
 # --------------------------------------------------------------------------- #
 # Independent verification                                                     #
 # --------------------------------------------------------------------------- #
-def shifted_rolling_mean(frame, *, window_size: int, min_history: int):
+def shifted_rolling_mean(frame, *, window_size: int, min_history: int, split_by_format: bool = True):
     """Mean views of the preceding ``window_size`` videos, per channel.
 
     ``frame`` must have ``channel_id``, ``published_at``, ``video_id`` and
-    ``view_count``. The result is aligned to ``frame``'s index.
+    ``view_count``; ``is_shorts`` too when ``split_by_format``. The result is
+    aligned to ``frame``'s index.
 
     ``shift(1)`` is what excludes each video from its own baseline. Without it
     the target leaks: a video's own views would inflate the average it is
     compared against, so every ratio would drift toward 1.0 and the model would
     learn a relationship that cannot exist at prediction time.
     """
-    ordered = frame.sort_values(["channel_id", "published_at", "video_id"])
+    keys = ["channel_id", "is_shorts"] if split_by_format else ["channel_id"]
+    ordered = frame.sort_values([*keys, "published_at", "video_id"])
     return (
-        ordered.groupby("channel_id")["view_count"]
+        # dropna=False keeps rows whose is_shorts is still undetermined in
+        # their own group rather than silently discarding them.
+        ordered.groupby(keys, dropna=False)["view_count"]
         .transform(lambda s: s.shift(1).rolling(window=window_size, min_periods=min_history).mean())
         .reindex(frame.index)
     )
 
 
-def verify_with_pandas(*, window_size: int, min_history: int, tolerance: float = 1e-6) -> bool:
+def verify_with_pandas(
+    *, window_size: int, min_history: int, split_by_format: bool = True, tolerance: float = 1e-6
+) -> bool:
     """Recompute the baseline in pandas and compare against the stored values.
 
     Deliberately a second implementation rather than a repeat of the same SQL:
@@ -275,7 +297,7 @@ def verify_with_pandas(*, window_size: int, min_history: int, tolerance: float =
     import pandas as pd
 
     frame = pd.read_sql(
-        "SELECT video_id, channel_id, published_at, view_count, "
+        "SELECT video_id, channel_id, published_at, view_count, is_shorts, "
         "recent_channel_avg_views, performance_ratio FROM videos "
         "WHERE published_at IS NOT NULL",
         get_engine(),
@@ -285,7 +307,9 @@ def verify_with_pandas(*, window_size: int, min_history: int, tolerance: float =
         return True
 
     frame = frame.sort_values(["channel_id", "published_at", "video_id"]).reset_index(drop=True)
-    expected_avg = shifted_rolling_mean(frame, window_size=window_size, min_history=min_history)
+    expected_avg = shifted_rolling_mean(
+        frame, window_size=window_size, min_history=min_history, split_by_format=split_by_format
+    )
     frame["expected_avg"] = expected_avg
     frame["expected_ratio"] = frame["view_count"] / frame["expected_avg"].replace(0, pd.NA)
 
@@ -314,6 +338,7 @@ def run(
     *,
     window_size: int = BASELINE_WINDOW,
     min_history: int = MIN_HISTORY,
+    split_by_format: bool = True,
     dry_run: bool = False,
     verify: bool = False,
 ) -> RunStats:
@@ -323,10 +348,15 @@ def run(
         with managed_session() as session:
             logger.info(
                 "Computing targets: baseline = mean of up to %d preceding videos, "
-                "minimum %d of history.",
-                window_size, min_history,
+                "minimum %d of history, split by format: %s.",
+                window_size, min_history, split_by_format,
             )
-            updated = compute_targets(session, window_size=window_size, min_history=min_history)
+            updated = compute_targets(
+                session,
+                window_size=window_size,
+                min_history=min_history,
+                split_by_format=split_by_format,
+            )
 
             if dry_run:
                 session.rollback()
@@ -345,7 +375,7 @@ def run(
         return stats
 
     if verify and not dry_run and not verify_with_pandas(
-        window_size=window_size, min_history=min_history
+        window_size=window_size, min_history=min_history, split_by_format=split_by_format
     ):
         logger.error("Stored targets do not match an independent recomputation.")
 
@@ -366,6 +396,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-history", type=int, default=MIN_HISTORY,
         help="Minimum preceding videos required before a baseline is trusted.",
+    )
+    parser.add_argument(
+        "--no-split-shorts",
+        action="store_true",
+        help="Compare every video against one channel-wide baseline instead of "
+             "separate Shorts and long-form baselines.",
     )
     parser.add_argument(
         "--verify", action="store_true", help="Recompute in pandas and compare against the stored values."
@@ -398,6 +434,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     stats = run(
         window_size=args.window,
         min_history=args.min_history,
+        split_by_format=not args.no_split_shorts,
         dry_run=args.dry_run,
         verify=args.verify,
     )
